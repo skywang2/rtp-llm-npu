@@ -9,6 +9,7 @@ from .ffn_weight import (
 )
 from .group_wise_quant_weight import GroupWiseWeight
 from .mixed_fp4_quant_weight import MixedFp4Weight
+from .w8a8_mxfp8_weight import AscendW8A8MXFP8Weight
 from .omni_quant_weight import OmniQuantWeightInfo
 from .per_block_fp8_quant_weight import PerBlockFp8Weight
 from .per_channel_fp8_quant_weight import PerChannelFp8Weight

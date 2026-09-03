@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from rtp_llm.config.quant_config import (
+    AscendW8A8MXFP8Config,
     Fp8BlockWiseQuantConfig,
     QuantizationConfig,
     W4a8Int4PerChannelQuantConfig,
@@ -561,10 +562,17 @@ class ModelConfig(CppModelConfig):
 
         # Set quant_algo if quant_config exists
         if quant_config:
+            cpp_group_size = quant_config.group_size()
+            if isinstance(quant_config, AscendW8A8MXFP8Config):
+                # C++ QuantAlgo only accepts group sizes {0, 16, 64, 128}; the
+                # MXFP8 1x32 grouping is fixed by the npu ops themselves, so
+                # pass 0 (per-tensor bookkeeping) to the C++ side. The python
+                # side keeps group_size() == 32 (used by AscendW8A8MXFP8Weight).
+                cpp_group_size = 0
             self.quant_algo.setQuantAlgo(
                 quant_config.get_algo().lower(),
                 quant_config.bits,
-                quant_config.group_size(),
+                cpp_group_size,
             )
 
         # Initialize data_type: first try act_type, then config_dtype, finally default to FP16
@@ -593,12 +601,14 @@ class ModelConfig(CppModelConfig):
                 )
 
         # Apply quantization-specific overrides
-        if quant_config and isinstance(quant_config, Fp8BlockWiseQuantConfig):
+        if quant_config and isinstance(
+            quant_config, (Fp8BlockWiseQuantConfig, AscendW8A8MXFP8Config)
+        ):
             original_data_type = data_type
             data_type = WEIGHT_TYPE.BF16
             logging.info(
                 f"Overriding data_type from {original_data_type} to {data_type} "
-                f"because fp8_block_wise quantization only supports BF16"
+                f"because {type(quant_config).__name__} quantization only supports BF16"
             )
         elif quant_config and quant_config.get_method().lower() in [
             "smooth_quant",

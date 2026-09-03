@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from rtp_llm.device.device_type import is_ascend
 from rtp_llm.utils.module_util import has_module, resolve_symbol
 
 __all__ = [
@@ -51,11 +52,18 @@ _m_grouped_bf16_gemm_nt_masked_impl: Callable[..., Any] | None = None
 @functools.cache
 def has_deep_gemm() -> bool:
     """Whether the optional `deep_gemm` package is available."""
+    # W8A8_MXFP8: NPU uses torch_npu native ops, DeepGEMM is CUDA-only.
+    if is_ascend():
+        return False
     return has_module("deep_gemm")
 
 
 @functools.cache
 def is_deep_gemm_e8m0_used() -> bool:
+    # W8A8_MXFP8: NPU natively outputs E8M0 scales, no DeepGEMM UE8M0 requant
+    # is needed. Also avoids torch.cuda.get_device_capability() raising on NPU.
+    if is_ascend():
+        return False
     return torch.cuda.get_device_capability()[0] in [10, 12]
 
 
