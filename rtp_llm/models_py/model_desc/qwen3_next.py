@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
@@ -39,6 +40,71 @@ from rtp_llm.models_py.triton_kernels.fla.aiter_flydsl_gdn_decode import (
     prepare_aiter_flydsl_gdn_decode_state_indices,
     validate_aiter_flydsl_gdn_decode_real_state_indices,
 )
+
+# ---------------------------------------------------------------------------
+# Optional NPU step-window profiler (env + arm-file gated, zero cost when off).
+#
+# The C++ StepWindowProfiler (gen_timeline) only records cpu_op events on
+# torch_npu (no NPU kernels), so kernel-level traces need the Python
+# torch_npu.profiler. Arm with: RTP_TNP_PROFILE_ARM=<file>,
+# RTP_TNP_PROFILE_STEPS=<n> (default 10), RTP_TNP_PROFILE_DIR=<dir>; creating
+# the arm file starts a wait=1/active=n window on the next forward calls
+# (prefill consumes the wait step, then n decode steps are recorded).
+# ---------------------------------------------------------------------------
+_NPU_STEP_PROFILER_STATE = None
+
+
+def _npu_step_profile_tick() -> None:
+    global _NPU_STEP_PROFILER_STATE
+    if _NPU_STEP_PROFILER_STATE is None:
+        arm = os.environ.get("RTP_TNP_PROFILE_ARM", "")
+        if not arm or not os.path.exists(arm):
+            return
+        import torch_npu
+
+        steps = int(os.environ.get("RTP_TNP_PROFILE_STEPS", "10"))
+        # Output dir must be explicit: a built-in default would bake a local
+        # workspace path into the source tree.
+        out_dir = os.environ.get("RTP_TNP_PROFILE_DIR", "")
+        if not out_dir:
+            logging.warning(
+                "RTP_TNP_PROFILE_ARM is set but RTP_TNP_PROFILE_DIR is empty; "
+                "skipping NPU step profiling"
+            )
+            return
+        prof = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            schedule=torch_npu.profiler.schedule(wait=1, warmup=0, active=steps, repeat=1),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                dir_name=out_dir, worker_name="wr0"
+            ),
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            ),
+        )
+        prof.start()
+        prof.step()  # this forward call = the wait step
+        _NPU_STEP_PROFILER_STATE = {"prof": prof, "ticks": 1, "steps": steps}
+        try:  # one-shot: disarm so later requests never re-trigger profiling
+            os.unlink(arm)
+        except OSError:
+            pass
+        return
+    st = _NPU_STEP_PROFILER_STATE
+    st["prof"].step()
+    st["ticks"] += 1
+    # wait(1) + active(steps) steps done -> the next step() enters NONE and
+    # fires on_trace_ready; stop right after the save tick.
+    if st["ticks"] >= st["steps"] + 2:
+        try:
+            st["prof"].stop()
+        finally:
+            _NPU_STEP_PROFILER_STATE = None
+
 from rtp_llm.models_py.triton_kernels.fla.aiter_flydsl_gdn_prefill import (
     build_aiter_flydsl_gdn_prefill_metadata,
     chunk_gated_delta_rule_aiter_flydsl_with_intermediate_states,
@@ -1689,6 +1755,7 @@ class Qwen3NextModel(GptModelBase):
         return self.embed_tokens(input_ids)
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        _npu_step_profile_tick()
         if torch.version.hip is not None and isinstance(
             fmha_impl, (_QwenGraphAttentionImpls, _QwenGdnGraphDelegate)
         ):
